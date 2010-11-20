@@ -1,0 +1,249 @@
+#!/bin/bash
+
+MV=${MV:=/bin/mv}
+LN=${LN:=/bin/ln}
+RM=${RM:=/bin/rm}
+MKDIR=${MKDIR:=/bin/mkdir}
+STAT=${STAT:=/usr/bin/stat}
+DATE=${DATE:=/bin/date}
+#DATE=${DATE:=/opt/local/bin/gdate}
+
+# GNU date or BSD date
+${DATE} --version > /dev/null 2>&1 && GNUDATE=yes
+
+# GNU stat or BSD stat
+${STAT} --version > /dev/null 2>&1 && GNUSTAT=yes
+
+# Default
+KEEP_YEAR=2
+KEEP_MONTH=6
+KEEP_WEEK=6
+KEEP_DAY=7
+
+DATEFMT=${DATEFMT:="%Y/%m/%d"}
+DATEFMTDEPTH="$(echo $DATEFMT | tr -c -d / | wc -c)"
+
+keeplist=""
+
+# now date
+NOW=$(${DATE} +%s)                 # seconds from Epoch
+
+usage() {
+	echo "Usage: backup-clean BASE"
+	echo "  -k nnYnnMnnWnnD       use params decide delete directories"
+	echo "  -v                    verbose mode"
+	echo "  -n                    don't actually run any commands"
+	echo "  -f FORMAT             FORMAT controls relative-path \`date +FORMAT'"
+	exit 1
+}
+
+opt_parse() {
+	while getopts "nvf:k:d:h?" flag; do
+		case $flag in
+		v)
+			verbose=yes
+			;;
+		n)
+			dryrun=yes
+			MV="echo mv"
+			LN="echo ln"
+			RM="echo rm"
+			MKDIR="echo mkdir"
+			;;
+		k)
+			[[ "$OPTARG" =~ ([0-9]+)Y ]] && KEEP_YEAR=${BASH_REMATCH[1]}
+			[[ "$OPTARG" =~ ([0-9]+)M ]] && KEEP_MONTH=${BASH_REMATCH[1]}
+			[[ "$OPTARG" =~ ([0-9]+)W ]] && KEEP_WEEK=${BASH_REMATCH[1]}
+			[[ "$OPTARG" =~ ([0-9]+)D ]] && KEEP_DAY=${BASH_REMATCH[1]}
+			;;
+		f)
+			DATEFMT=$OPTARG
+			;;
+		d)	NOW=$OPTARG;;
+		\?|h)
+			usage;;
+		*)
+			break;;
+		esac
+	done
+	shift $(($OPTIND - 1))
+
+	[ $# -ne 1 ] && usage
+	basedir=$1
+}
+
+epoch() {
+	datestr=$1;
+
+	if [ "${GNUDATE}" == "yes" ]; then
+		echo $(${DATE} -d "${datestr}" +%s)
+	else
+		echo $(${DATE} -j -f '%F %T' "${datestr}" +%s)
+	fi
+}
+
+fromepoch() {
+	secepoch=$1; fmt=$2
+
+	if [ "${GNUDATE}" == "yes" ]; then
+		echo $(${DATE} -d "@${secepoch}" "${fmt}")
+	else
+		echo $(${DATE} -j -f '%s' ${secepoch} "${fmt}")
+	fi
+}
+
+dateago() {
+	delta=$1; unit=$2; secepoch=$3
+
+	if [ "${GNUDATE}" == "yes" ]; then
+		datestr=$(${DATE} -d @${secepoch} "+%F %T")
+		echo $(${DATE} -d "${delta} ${unit} ago ${datestr}" +%s)
+	else
+		echo $(${DATE} -j -v-${delta}${unit::1} -f '%s' "${secepoch}" +%s)
+	fi
+}
+
+create_keeplist() {
+	NOW_YEAR=$(fromepoch ${NOW} +%Y)
+	NOW_MONTH=$(fromepoch ${NOW} +%m)
+	NOW_WEEKDAY=$(fromepoch ${NOW} +%w)
+	NOW_DAY=$(fromepoch ${NOW} +%d)
+
+	basesec=$(epoch "${NOW_YEAR}-01-01 00:00:00")
+	for ((i = 0;i < ${KEEP_YEAR};i++)); do
+		keepsec=$(dateago $i year ${basesec})
+		keeplist="$keeplist $keepsec"
+	done
+
+	basesec=$(epoch "${NOW_YEAR}-${NOW_MONTH}-01 00:00:00")
+	for ((i = 0;i < ${KEEP_MONTH};i++)); do
+		keepsec=$(dateago $i month ${basesec})
+		keeplist="$keeplist $keepsec"
+	done
+
+	basesec=$(epoch "${NOW_YEAR}-${NOW_MONTH}-${NOW_DAY} 00:00:00")
+	basesec=$(dateago ${NOW_WEEKDAY} day ${basesec})
+	for ((i = 0;i < ${KEEP_WEEK};i++)); do
+		keepsec=$(dateago $i week ${basesec})
+		keeplist="$keeplist $keepsec"
+	done
+
+	basesec=$(epoch "${NOW_YEAR}-${NOW_MONTH}-${NOW_DAY} 00:00:00")
+	for ((i = 0;i < ${KEEP_DAY};i++)); do
+		keepsec=$(dateago $i day ${basesec})
+		keeplist="$keeplist $keepsec"
+	done
+
+	keeplist=$(echo $keeplist | tr ' ' '\n' | sort -u)
+
+	#echo $keeplist | LANG=C xargs -n 1 date -j -f '%s'
+}
+
+iskeep() {
+	datepoint=$1
+
+	for keepsec in $keeplist; do
+		if (( keepsec <= datepoint && datepoint < keepsec+86400 )); then
+			return 0;
+		fi
+	done
+	return 1
+}
+
+inode() {
+	file=$1
+
+	if [ "${GNUSTAT}" == "yes" ]; then
+		${STAT} -L -c %i $file 2> /dev/null
+	else
+		${STAT} -L -f %i $file 2> /dev/null
+	fi
+}
+
+linkdatefmt() {
+	datepoint=$1
+
+	history=$basedir/history
+	datepath=$history/$datepoint
+	datelink=$basedir/$(fromepoch $datepoint +"$DATEFMT")
+
+	pdir=$(dirname $datelink)
+	[ ! -d $pdir ] && $MKDIR -p $pdir
+
+	idatepath="$(inode $datepath)"
+
+	i=0; link=$datelink
+	while [ -d $link ]; do
+		if [ "$idatepath" == "$(inode $link)" ]; then
+			return
+		fi
+		link="${datelink}_$((++i))"
+	done
+	datelink=$link
+
+	#$LN -s $datepath $datelink
+
+	datepath=history/$datepoint
+	for ((i=0;i<$DATEFMTDEPTH;i++)); do
+		datepath="../$datepath"
+	done
+
+	$LN -s $datepath $datelink
+}
+
+deletedatefmt() {
+	datepoint=$1
+
+	history=$basedir/history
+	datepath=$history/$datepoint
+	datelink=$basedir/$(fromepoch $datepoint +"$DATEFMT")
+
+	idatepath="$(inode $datepath)"
+
+	pdir=$(dirname $datelink)
+	[ -d $pdir ] && for e in $(ls -1 ${pdir}); do
+		link=${pdir}/${e}
+		if [ -h $link -a "$idatepath" == "$(inode $link)" ]; then
+			${RM} $link
+		fi
+	done
+}
+
+backup_clean() {
+	last=$basedir/last
+	trash=$basedir/trash
+	history=$basedir/history
+	lastdatepoint=0
+
+	create_keeplist
+
+	for datepoint in $(ls -1 $history); do
+		if [[ "$datepoint" =~ progress-[0-9]+ ]]; then
+			${RM} -rf $history/$datepoint
+			continue
+		fi
+		if [[ !("$datepoint" =~ [0-9]+) ]]; then
+			echo "unrecognize path \`$datepoint'"
+			continue
+		fi
+		printf "%s (%s) " $datepoint "$(fromepoch $datepoint "+%F %T")"
+		if iskeep $datepoint; then
+			echo keep
+			linkdatefmt $datepoint
+			[ $datepoint -gt $lastdatepoint ] && lastdatepoint=$datepoint
+		else
+			echo delete
+			#${RM} -rf $history/$datepoint
+			[ -d $trash ] && ${MKDIR} -p $trash
+			${MV} $history/$datepoint $trash
+			deletedatefmt $datepoint
+		fi
+	done
+
+	${RM} $last
+	${LN} -s history/$lastdatepoint $last
+	${RM} -rf $trash
+}
+
+opt_parse "$@"
+backup_clean

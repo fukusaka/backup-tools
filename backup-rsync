@@ -1,0 +1,160 @@
+#!/bin/bash
+
+MV=${MV:=/bin/mv}
+LN=${LN:=/bin/ln}
+RM=${RM:=/bin/rm}
+MKDIR=${MKDIR:=/bin/mkdir}
+RSYNC=${RSYNC:=/usr/bin/rsync}
+STAT=${STAT:=/usr/bin/stat}
+DATE=${DATE:=/bin/date}
+#DATE=${DATE:=/opt/local/bin/gdate}
+
+# GNU date or BSD date
+${DATE} --version > /dev/null 2>&1 && GNUDATE=yes
+
+# GNU stat or BSD stat
+${STAT} --version > /dev/null 2>&1 && GNUSTAT=yes
+
+# Default
+RSYNCOPTS=${RSYNCOPTS:=""}
+DATEFMT=${DATEFMT:="%Y/%m/%d"}
+DATEFMTDEPTH="$(echo $DATEFMT | tr -c -d / | wc -c)"
+
+# now date
+NOW=$(${DATE} +%s)
+
+#
+# backupdiff rsync://hostname/directory /backup-base-directory
+#
+
+usage() {
+	echo "Usage: backupdiff SRC BASE [ -- append-rsync-options ]"
+	echo "  -v                    verbose mode"
+	echo "  -n                    don't actually run any commands"
+	echo "  -d datestring         specify backup time"
+	echo "  -f FORMAT             FORMAT controls relative-path \`date +FORMAT'"
+	exit 1
+}
+
+opt_parse() {
+	while getopts "nvf:s:d:h?o" flag; do
+		case $flag in
+		v)	verbose=yes
+			RSYNCOPTS="$RSYNCOPTS -v"
+			;;
+		n)	dryrun=yes
+			MV="echo mv"
+			LN="echo ln"
+			RM="echo rm"
+			MKDIR="echo mkdir"
+			RSYNC="echo rsync"
+			;;
+		f)	DATEFMT=$OPTARG;;
+		d)	NOW=$OPTARG;;
+		\?|h)	usage;;
+	       *)	break;;
+		esac
+	done
+	shift $(($OPTIND - 1))
+
+	[ $# -lt 2 ] && usage
+	srcdir=$1; basedir=$2; shift 2
+	[ $srcdir == '--' -o $basedir == '--' ] && usage
+
+	if [ $# -ge 1 ]; then
+		[ "x$1" == 'x--' ] && shift || usage
+		RSYNCOPTS="$RSYNCOPTS $*"
+	fi
+}
+
+fromepoch() {
+	secepoch=$1; fmt=$2
+
+	if [ "${GNUDATE}" == "yes" ]; then
+		echo $(${DATE} -d "@${secepoch}" "${fmt}")
+	else
+		echo $(${DATE} -j -f '%s' ${secepoch} "${fmt}")
+	fi
+}
+
+inode() {
+	file=$1
+
+	if [ "${GNUSTAT}" == "yes" ]; then
+		${STAT} -L -c %i $file 2> /dev/null
+	else
+		${STAT} -L -f %i $file 2> /dev/null
+	fi
+}
+
+linkdatefmt() {
+	datepoint=$1
+
+	history=$basedir/history
+	datepath=$history/$datepoint
+	datelink=$basedir/$(fromepoch $datepoint +"$DATEFMT")
+
+	pdir=$(dirname $datelink)
+	[ ! -d $pdir ] && $MKDIR -p $pdir
+
+	idatepath="$(inode $datepath)"
+
+	i=0; link=$datelink
+	while [ -d $link ]; do
+		if [ "$idatepath" == "$(inode $link)" ]; then
+			return
+		fi
+		link="${datelink}_$((++i))"
+	done
+	datelink=$link
+
+	#$LN -s $datepath $datelink
+
+	datepath=history/$datepoint
+	for ((i=0;i<$DATEFMTDEPTH;i++)); do
+		datepath="../$datepath"
+	done
+
+	$LN -s $datepath $datelink
+}
+
+backup_diff() {
+	datepoint=$NOW
+
+	last=$basedir/last
+	history=$basedir/history
+	datepath=$history/$datepoint
+	progress=$history/progress-$datepoint
+
+	[ ! -d $history ] && $MKDIR -p $history
+
+	lastopts=""
+	if [ -e $last ]; then
+		if [ -h $last ]; then
+			lastdatepath=$(readlink $last)
+			if [ "${lastdatepath::1}" != "/" ]; then
+				lastdatepath="$basedir/$lastdatepath"
+			fi
+			lastopts="--link-dest $lastdatepath"
+		else
+			echo "not symblic file \`$last'"
+			return 1
+		fi
+	fi
+
+	echo "Backup" $(fromepoch $datepoint +"$DATEFMT") "($datepoint)"
+	$RSYNC -a --delete $RSYNCOPTS $lastopts $srcdir $progress
+	if [ $? -ne 0 ]; then
+		$RM -rf $progress
+		return 2
+	fi
+
+	$MV $progress $datepath
+	$RM $last
+	$LN -s history/$datepoint $last
+
+	linkdatefmt $datepoint
+}
+
+opt_parse "$@"
+backup_diff
