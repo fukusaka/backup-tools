@@ -234,7 +234,7 @@ backup_clean() {
 		else
 			echo delete
 			#${RM} -rf $history/$datepoint
-			[ -d $trash ] && ${MKDIR} -p $trash
+			[ ! -d $trash ] && ${MKDIR} -p $trash
 			${MV} $history/$datepoint $trash
 			deletedatefmt $datepoint
 		fi
